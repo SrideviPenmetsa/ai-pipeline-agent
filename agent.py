@@ -1,0 +1,64 @@
+from dotenv import load_dotenv
+from langchain_openai import ChatOpenAI
+from langchain.agents import AgentExecutor, create_openai_tools_agent
+from langchain.tools import tool
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+
+load_dotenv()
+
+# --- Define tools the agent can use ---
+@tool
+def analyze_airflow_log(log_text: str) -> str:
+    """Analyzes an Airflow task log and identifies the error type."""
+    if "FileNotFoundError" in log_text:
+        return "Root cause: Missing S3 file. The upstream task likely failed to write the file."
+    elif "OperationalError" in log_text:
+        return "Root cause: Database connection issue. Check Redshift cluster status."
+    elif "MemoryError" in log_text:
+        return "Root cause: Out of memory. PySpark job needs more executor memory."
+    else:
+        return f"Unknown error pattern. Raw log: {log_text[:200]}"
+
+@tool  
+def get_similar_past_incidents(error_type: str) -> str:
+    """Retrieves similar past pipeline incidents from history."""
+    incidents = {
+        "FileNotFoundError": "2024-03-15: Same error on sales_etl DAG. Fixed by adding S3 existence check in upstream task. Resolution time: 45 mins.",
+        "OperationalError": "2024-04-02: Redshift connection pool exhausted during peak load. Fixed by increasing max_connections. Resolution: 2 hours.",
+        "MemoryError": "2024-02-28: customer_data DAG OOM. Fixed by adding repartition(200) before join. Resolution: 1 hour."
+    }
+    return incidents.get(error_type, "No similar past incidents found.")
+
+# --- Set up the agent ---
+llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0)
+
+tools = [analyze_airflow_log, get_similar_past_incidents]
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", """You are an expert data engineering incident analyst. 
+    When given a pipeline failure log, you:
+    1. Analyze the log to identify the root cause
+    2. Search for similar past incidents  
+    3. Provide a clear diagnosis and recommended fix
+    Be concise and actionable."""),
+    ("human", "{input}"),
+    MessagesPlaceholder(variable_name="agent_scratchpad"),
+])
+
+agent = create_openai_tools_agent(llm, tools, prompt)
+agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+
+# --- Test it with a fake Airflow log ---
+fake_log = """
+[2025-05-26 09:15:23] Task failed: customer_etl.load_to_redshift
+[2025-05-26 09:15:23] Traceback (most recent call last):
+[2025-05-26 09:15:23] FileNotFoundError: s3://data-lake/customers/2025-05-26/raw.parquet not found
+[2025-05-26 09:15:23] Task instance marked as FAILED
+"""
+
+result = agent_executor.invoke({
+    "input": f"This Airflow DAG just failed. Please diagnose and recommend a fix:\n{fake_log}"
+})
+
+print("\n=== AGENT DIAGNOSIS ===")
+print(result["output"])
