@@ -1,12 +1,41 @@
 from dotenv import load_dotenv
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI,OpenAIEmbeddings
 from langchain.agents import AgentExecutor, create_openai_tools_agent
 from langchain.tools import tool
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.documents import Document
+from langchain_community.vectorstores import Chroma
 
 load_dotenv()
 
-# --- Define tools the agent can use ---
+# --- 1. Set up the Vector Database for Incidents ---
+# Initialize the embedding model
+embeddings = OpenAIEmbeddings()
+
+# Convert your historical incidents into LangChain Document objects
+past_incidents_data = [
+    Document(
+        page_content="2024-03-15: FileNotFoundError on sales_etl DAG. Fixed by adding S3 existence check in upstream task. Resolution time: 45 mins.",
+        metadata={"error_type": "FileNotFoundError"}
+    ),
+    Document(
+        page_content="2024-04-02: OperationalError. Redshift connection pool exhausted during peak load. Fixed by increasing max_connections. Resolution: 2 hours.",
+        metadata={"error_type": "OperationalError"}
+    ),
+    Document(
+        page_content="2024-02-28: MemoryError in customer_data DAG OOM. Fixed by adding repartition(200) before join. Resolution: 1 hour.",
+        metadata={"error_type": "MemoryError"}
+    )
+]
+
+# Create an in-memory Chroma vector store populated with the documents
+incident_vdb = Chroma.from_documents(
+    documents=past_incidents_data, 
+    embedding=embeddings,
+    collection_name="past_pipeline_incidents"
+)
+
+# --- 2. Define tools the agent can use ---
 @tool
 def analyze_airflow_log(log_text: str) -> str:
     """Analyzes an Airflow task log and identifies the error type."""
@@ -20,16 +49,18 @@ def analyze_airflow_log(log_text: str) -> str:
         return f"Unknown error pattern. Raw log: {log_text[:200]}"
 
 @tool  
-def get_similar_past_incidents(error_type: str) -> str:
-    """Retrieves similar past pipeline incidents from history."""
-    incidents = {
-        "FileNotFoundError": "2024-03-15: Same error on sales_etl DAG. Fixed by adding S3 existence check in upstream task. Resolution time: 45 mins.",
-        "OperationalError": "2024-04-02: Redshift connection pool exhausted during peak load. Fixed by increasing max_connections. Resolution: 2 hours.",
-        "MemoryError": "2024-02-28: customer_data DAG OOM. Fixed by adding repartition(200) before join. Resolution: 1 hour."
-    }
-    return incidents.get(error_type, "No similar past incidents found.")
+def get_similar_past_incidents(query: str) -> str:
+    """Searches the incident vector database for past pipeline failures similar to the given query."""
+    # Perform a similarity search against the vector database
+    # k=1 returns the single most relevant past incident
+    results = incident_vdb.similarity_search(query, k=1)
+    
+    if results:
+        # Return the text of the matched document
+        return results[0].page_content
+    return "No similar past incidents found."
 
-# --- Set up the agent ---
+# --- 3. Set up the agent ---
 llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0)
 
 tools = [analyze_airflow_log, get_similar_past_incidents]
